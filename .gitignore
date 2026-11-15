@@ -1,0 +1,37 @@
+# --- secrets: never commit ---
+secrets/
+.env
+*.env
+!.env.example
+*.key
+*.pem
+id_*
+
+# --- domain files: local only ---
+*/docs/
+*/inbox/
+
+# --- a lot as a folder (lot.py): platform files and raw answers — local only ---
+tenders/lots/*/*/docs/
+tenders/lots/*/*/protocols/
+tenders/lots/*/*/lot.json
+tenders/lots/seen*.json
+
+# --- firms' papers ---
+firms/*/docs/
+
+# --- the intake at the root ---
+/inbox/
+
+# --- drafts at the base, not going to git ---
+scratch/
+
+# --- OS / editors ---
+.DS_Store
+.obsidian/
+
+# --- python (when code projects appear) ---
+__pycache__/
+*.pyc
+.venv/
+venv/

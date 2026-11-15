@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""check — a run of the namespace check: links, names, tables, secrets, Windows.
+
+Executor of meta-vault/operations/check-links-and-names.md. Run from anywhere:
+    python3 bin/check            # report            (Windows: py bin\\check)
+    python3 bin/check --quiet    # numbers only
+Exit code 1 if anything is broken. Reads only; never edits files.
+Warnings (long paths, machine paths) are printed but do not fail the run.
+"""
+import os, re, subprocess, sys, datetime
+from collections import defaultdict
+
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Windows: names NTFS cannot create (clone fails on checkout), and path length.
+NTFS_BAD = re.compile(r'[<>:"\\|?*]|[ .]$')
+NTFS_RESERVED = re.compile(r'^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$', re.I)
+LONG_PATH = 200   # characters from the root; together with C:\Users\<name>\... — under the 260 limit
+WALK_SKIP = {'.git', 'node_modules', '.venv', 'venv', '__pycache__', '.obsidian', '.pytest_cache'}
+# Paths of another machine in texts: they do not exist on a different machine.
+MACHINE_PATH = re.compile(r'(/Users/(?!Shared/)[A-Za-z0-9._-]+/|/home/[A-Za-z0-9._-]+/|[A-Za-z]:\\Users\\[^\\\s]+)')
+TEXT_EXT = ('.md', '.py', '.sh', '.ps1', '.cmd', '.json', '.toml', '.txt', '.yml', '.yaml', '.js', '.ts')
+SKIP_DIRS = {'.git', 'secrets', 'archive', '.obsidian', 'node_modules', '.venv', 'venv'}
+SKIP_PATH_PARTS = ('/docs/', '/inbox/')
+LINK = re.compile(r'\[\[([^\]]+)\]\]')
+CODE_SPAN = re.compile(r'`[^`]*`')
+TABLE_UNESCAPED = re.compile(r'\[\[[^\]]*?[^\\]\|[^\]]*\]\]')
+SECRET = r'(api[_-]?key|token|password|passwd|secret)[[:space:]]*[:=][[:space:]]*[A-Za-z0-9_/+.-]{16,}'
+
+
+def md_files():
+    for d, dirs, files in os.walk(ROOT):
+        # `archive` is skipped only at the root (the base's own sink); a data folder named archive
+        # deeper (school/archive/, finance/archive/) is the owner's records and is read
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS or (x == 'archive' and d != ROOT)]
+        rel = os.path.relpath(d, ROOT) + '/'
+        if any(p in '/' + rel for p in SKIP_PATH_PARTS):
+            continue
+        for f in files:
+            if f.endswith('.md'):
+                yield os.path.join(d, f)
+
+
+def prose_lines(path):
+    """Lines outside fenced code blocks, with inline code spans removed."""
+    fence = None
+    for n, line in enumerate(open(path, encoding='utf-8'), 1):
+        s = line.lstrip()
+        if s.startswith('```') or s.startswith('~~~'):
+            mark = s[:3]
+            fence = None if fence == mark else (fence or mark)
+            continue
+        if fence or line.startswith('    '):
+            continue
+        yield n, line, CODE_SPAN.sub('', line)
+
+
+def main():
+    quiet = '--quiet' in sys.argv
+    files = list(md_files())
+    by_name = defaultdict(list)
+    for f in files:
+        by_name[os.path.splitext(os.path.basename(f))[0]].append(f)
+
+    checked, broken, ambiguous, folder, pipes = 0, [], [], [], []
+    for f in files:
+        rel = os.path.relpath(f, ROOT)
+        for n, raw, line in prose_lines(f):
+            if line.lstrip().startswith('|'):
+                for m in TABLE_UNESCAPED.finditer(line):
+                    pipes.append(f'{rel}:{n}: {m.group(0)}')
+            for m in LINK.finditer(line):
+                target = re.split(r'\\?\||#', m.group(1))[0].strip()
+                if not target:
+                    continue
+                checked += 1
+                cands = [os.path.normpath(os.path.join(os.path.dirname(f), target)),
+                         os.path.normpath(os.path.join(ROOT, target))]
+                if any(os.path.isfile(c + '.md') or os.path.isfile(c) for c in cands):
+                    continue
+                if any(os.path.isdir(c) for c in cands) or target.endswith('/'):
+                    folder.append(f'{rel}:{n}: [[{m.group(1)}]]')
+                    continue
+                same = by_name.get(os.path.basename(target), [])
+                if '/' not in target and len(same) == 1:
+                    continue
+                if '/' not in target and len(same) > 1:
+                    ambiguous.append(f'{rel}:{n}: [[{m.group(1)}]] — name is not unique, a path is needed')
+                else:
+                    broken.append(f'{rel}:{n}: [[{m.group(1)}]]')
+
+    secrets_hits, secrets_tracked = [], []
+    git = os.path.isdir(os.path.join(ROOT, '.git'))
+    if git:
+        r = subprocess.run(['git', '-C', ROOT, 'grep', '-nEi', SECRET], capture_output=True, text=True)
+        secrets_hits = [l for l in r.stdout.splitlines() if l and not l.startswith('bin/check')]
+        r = subprocess.run(['git', '-C', ROOT, 'ls-files', 'secrets', '*.env', '*.key', '*.pem'],
+                           capture_output=True, text=True)
+        secrets_tracked = [l for l in r.stdout.splitlines() if l]
+
+    ntfs, long_paths, machine = [], [], []
+    for d, dirs, names in os.walk(ROOT):
+        dirs[:] = [x for x in dirs if x not in WALK_SKIP]
+        for n in dirs + names:
+            p = os.path.join(d, n)
+            rel = os.path.relpath(p, ROOT)
+            if NTFS_BAD.search(n) or NTFS_RESERVED.match(n):
+                ntfs.append(rel)
+            if len(rel) > LONG_PATH:
+                long_paths.append(f'{len(rel)}: {rel}')
+            if n in names and n.endswith(TEXT_EXT) and rel != os.path.join('bin', 'check'):
+                try:
+                    for i, line in enumerate(open(p, encoding='utf-8'), 1):
+                        m = MACHINE_PATH.search(line)
+                        if m:
+                            machine.append(f'{rel}:{i}: {m.group(0)}')
+                except (UnicodeDecodeError, OSError):
+                    pass
+
+    todo = sum(open(f, encoding='utf-8').read().count('<configure') for f in files)
+
+    today = datetime.date.today().isoformat()
+    print(f'check {today} · files {len(files)} · links checked {checked}')
+    rows = [('broken links', broken), ('non-unique names without a path', ambiguous),
+            ('links to folders', folder), ('unescaped pipe in tables', pipes),
+            ('looks like a secret in the git index', secrets_hits), ('secrets under git', secrets_tracked),
+            ('names forbidden on Windows', ntfs)]
+    warnings = [(f'paths longer than {LONG_PATH} characters (Windows)', long_paths),
+                ('paths of this machine in texts', machine)]
+    for title, items in rows + [(f'warning — {t}', i) for t, i in warnings]:
+        print(f'  {title}: {len(items)}')
+        if not quiet:
+            for i in items:
+                print(f'    {i}')
+    if not git:
+        print('  git: none — secrets in the index not checked')
+    print(f'  <configure> marks left: {todo}')
+    sys.exit(1 if any(items for _, items in rows) else 0)
+
+
+if __name__ == '__main__':
+    main()
